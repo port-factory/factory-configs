@@ -1,0 +1,107 @@
+# Demo line for the data_platform team. No repositories are mounted and nothing files work into it, so it never runs.
+defaults:
+  model: claude-sonnet-5-5
+  environment: ui-bugs-demo
+
+service_accounts:
+  factory-agent@serviceaccounts.getport.io:
+    title: Factory agent
+
+agents:
+  data-dq-investigator:
+    description: Finds the root cause of failed data quality checks.
+    system_prompt: |
+      You investigate failed data quality checks: find the upstream change or bad data behind them. You always finish by calling the Port MCP tool report_work_item.
+  data-pipeline-fixer:
+    description: Fixes data pipelines and opens a pull request.
+    system_prompt: |
+      You fix data pipelines: correct the transformation or schema handling, backfill if needed, and open a pull request. You always finish by calling the Port MCP tool report_work_item.
+  data-dq-validator:
+    description: Reruns data quality checks and compares the data before and after a fix.
+    system_prompt: |
+      You rerun data quality checks and compare row counts and distributions before and after a fix. You always finish by calling the Port MCP tool report_work_item.
+
+line:
+  identifier: data_quality_alerts
+  title: Data Quality Alerts
+  description: >-
+    Takes a failed data quality check to a fixed pipeline. An agent finds the root cause, another fixes the pipeline, and a third reruns the checks.
+  team: [data_platform]
+  max_running: 4
+  stages:
+    - identifier: investigate
+      title: Investigate
+      description: Finds the root cause of the failed check.
+      executor: claude_managed_agent
+      agent: data-dq-investigator
+      executor_settings:
+        execution_identity: { type: service_account, identifier: factory-agent@serviceaccounts.getport.io }
+      instructions: |
+        Find which upstream change, late load or bad input caused the failed check, with the evidence.
+        Never end without calling report_work_item.
+      checkpoints:
+        - identifier: artifacts
+          type: schema
+          schema:
+            properties:
+              root_cause: { type: string, format: markdown, title: Root cause }
+            required: [root_cause]
+      max_tries: 3
+      timeout: 30m
+    - identifier: fix
+      title: Fix
+      description: Fixes the pipeline and opens a pull request.
+      executor: claude_managed_agent
+      agent: data-pipeline-fixer
+      executor_settings:
+        execution_identity: { type: service_account, identifier: factory-agent@serviceaccounts.getport.io }
+      instructions: |
+        Fix the transformation or schema handling, plan a backfill if one is needed, and open a pull request.
+        Never end without calling report_work_item.
+      checkpoints:
+        - identifier: artifacts
+          type: schema
+          schema:
+            properties:
+              pr_url: { type: string, format: url, title: Pull request }
+            required: [pr_url]
+        - identifier: pr_ready
+          type: entity_condition
+          title: The pull request is approved and its checks pass
+          entity:
+            blueprint: githubPullRequest
+            match: { link: '{{ .workItem.artifacts.pr_url }}' }
+          pass_when:
+            combinator: and
+            rules:
+              - { property: reviewDecision, operator: '=', value: APPROVED }
+              - { property: checksState, operator: in, value: [SUCCESS, NEUTRAL] }
+          reject_when:
+            - query:
+                combinator: and
+                rules:
+                  - { property: reviewDecision, operator: '=', value: CHANGES_REQUESTED }
+                  - { property: changesRequestedAt, operator: '>', value: '{{ .stageRun.startedAt }}' }
+              reason: 'A reviewer requested changes: {{ .entity.properties.changesRequestedComment // "see the review" }}'
+          progress: 'Review: {{ .entity.properties.reviewDecision // "pending" }}'
+      max_tries: 3
+      timeout: 1h
+    - identifier: validate
+      title: Validate
+      description: Reruns the checks after the fix.
+      executor: claude_managed_agent
+      agent: data-dq-validator
+      executor_settings:
+        execution_identity: { type: service_account, identifier: factory-agent@serviceaccounts.getport.io }
+      instructions: |
+        Rerun the failed checks and compare row counts and distributions before and after the fix.
+        Never end without calling report_work_item.
+      checkpoints:
+        - identifier: artifacts
+          type: schema
+          schema:
+            properties:
+              validation: { type: string, format: markdown, title: Validation }
+            required: [validation]
+      max_tries: 3
+      timeout: 30m

@@ -1,0 +1,100 @@
+# Demo line for the mobile team. No repositories are mounted and nothing files work into it, so it never runs.
+defaults:
+  model: claude-sonnet-5-5
+  environment: ui-bugs-demo
+
+service_accounts:
+  factory-agent@serviceaccounts.getport.io:
+    title: Factory agent
+
+agents:
+  mobile-crash-analyst:
+    description: Groups mobile crash reports and finds their cause.
+    system_prompt: |
+      You analyze mobile crash reports: group them by signature, find the cause in the code, and write reproduction steps. You always finish by calling the Port MCP tool report_work_item.
+  mobile-crash-fixer:
+    description: Fixes crashes in the iOS and Android apps and opens a pull request.
+    system_prompt: |
+      You fix mobile crashes in the iOS and Android apps, add a test, and open a pull request. You always finish by calling the Port MCP tool report_work_item.
+
+line:
+  identifier: crash_fixes
+  title: Crash Fixes
+  description: >-
+    Takes a crash spike from the crash reporter to a fix in the next release. An agent groups the crashes and finds the cause, another fixes it, QA tests it on devices, and it ships.
+  team: [mobile]
+  max_running: 4
+  stages:
+    - identifier: analyze
+      title: Analyze
+      description: Groups the crashes and finds the cause.
+      executor: claude_managed_agent
+      agent: mobile-crash-analyst
+      executor_settings:
+        execution_identity: { type: service_account, identifier: factory-agent@serviceaccounts.getport.io }
+      instructions: |
+        Group the crash reports by signature, find the cause in the code, and write reproduction steps with affected versions and devices.
+        Never end without calling report_work_item.
+      checkpoints:
+        - identifier: artifacts
+          type: schema
+          schema:
+            properties:
+              analysis: { type: string, format: markdown, title: Analysis }
+            required: [analysis]
+      max_tries: 3
+      timeout: 30m
+    - identifier: fix
+      title: Fix
+      description: Fixes the crash and opens a pull request.
+      executor: claude_managed_agent
+      agent: mobile-crash-fixer
+      executor_settings:
+        execution_identity: { type: service_account, identifier: factory-agent@serviceaccounts.getport.io }
+      instructions: |
+        Fix the crash, add a test that covers it, and open a pull request.
+        Never end without calling report_work_item.
+      checkpoints:
+        - identifier: artifacts
+          type: schema
+          schema:
+            properties:
+              pr_url: { type: string, format: url, title: Pull request }
+            required: [pr_url]
+        - identifier: pr_ready
+          type: entity_condition
+          title: The pull request is approved and its checks pass
+          entity:
+            blueprint: githubPullRequest
+            match: { link: '{{ .workItem.artifacts.pr_url }}' }
+          pass_when:
+            combinator: and
+            rules:
+              - { property: reviewDecision, operator: '=', value: APPROVED }
+              - { property: checksState, operator: in, value: [SUCCESS, NEUTRAL] }
+          reject_when:
+            - query:
+                combinator: and
+                rules:
+                  - { property: reviewDecision, operator: '=', value: CHANGES_REQUESTED }
+                  - { property: changesRequestedAt, operator: '>', value: '{{ .stageRun.startedAt }}' }
+              reason: 'A reviewer requested changes: {{ .entity.properties.changesRequestedComment // "see the review" }}'
+          progress: 'Review: {{ .entity.properties.reviewDecision // "pending" }}'
+      max_tries: 3
+      timeout: 1h
+    - identifier: device_qa
+      title: Device QA
+      description: QA reproduces the old crash and tests the fix on devices.
+      executor: human
+      executor_settings:
+        assignees: { teams: [mobile] }
+      instructions: |
+        Test the fix on the affected devices and OS versions, and confirm the crash is gone.
+    - identifier: release
+      title: Release
+      description: Ships the fix in the next app release.
+      executor: human
+      executor_settings:
+        assignees: { teams: [mobile] }
+      instructions: |
+        Include the fix in the next release and report the version.

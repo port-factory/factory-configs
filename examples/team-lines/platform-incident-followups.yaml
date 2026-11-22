@@ -1,0 +1,78 @@
+# Demo line for the platform team. No repositories are mounted and nothing files work into it, so it never runs.
+defaults:
+  model: claude-sonnet-5-5
+  environment: ui-bugs-demo
+
+service_accounts:
+  factory-agent@serviceaccounts.getport.io:
+    title: Factory agent
+
+agents:
+  platform-postmortem-writer:
+    description: Writes blameless postmortems from the incident timeline, alerts, deploys and chat.
+    system_prompt: |
+      You write blameless postmortems from the incident timeline, alerts, deploys and chat. You always finish by calling the Port MCP tool report_work_item.
+  platform-action-planner:
+    description: Turns a postmortem into concrete, owned action items in the team's tracker.
+    system_prompt: |
+      You turn a postmortem into concrete, owned action items in the team's tracker. You always finish by calling the Port MCP tool report_work_item.
+
+line:
+  identifier: incident_followups
+  title: Incident Follow-ups
+  description: >-
+    Turns a resolved incident into a reviewed postmortem and tracked action items, and checks they were done.
+  team: [platform]
+  max_running: 3
+  stages:
+    - identifier: postmortem
+      title: Postmortem
+      description: Drafts a blameless postmortem from the incident's timeline.
+      executor: claude_managed_agent
+      agent: platform-postmortem-writer
+      executor_settings:
+        execution_identity: { type: service_account, identifier: factory-agent@serviceaccounts.getport.io }
+      instructions: |
+        Collect the incident timeline, related alerts, deploys and messages, and draft a blameless postmortem: summary, impact, timeline, root cause, what went well, what to improve.
+        Never end without calling report_work_item.
+      checkpoints:
+        - identifier: artifacts
+          type: schema
+          schema:
+            properties:
+              postmortem: { type: string, format: markdown, title: Postmortem }
+            required: [postmortem]
+        - identifier: approve
+          type: human_input
+          kind: approval
+          title: Approve the postmortem
+          responders: { teams: [platform] }
+      max_tries: 3
+      timeout: 30m
+    - identifier: action_items
+      title: Action items
+      description: Files owned action items from the postmortem.
+      executor: claude_managed_agent
+      agent: platform-action-planner
+      executor_settings:
+        execution_identity: { type: service_account, identifier: factory-agent@serviceaccounts.getport.io }
+      instructions: |
+        File one ticket per improvement in the postmortem, each with an owner team and a due date, and report the list.
+        Never end without calling report_work_item.
+      checkpoints:
+        - identifier: artifacts
+          type: schema
+          schema:
+            properties:
+              action_items: { type: string, format: markdown, title: Action items }
+            required: [action_items]
+      max_tries: 3
+      timeout: 20m
+    - identifier: verify
+      title: Verify
+      description: The team confirms the action items are done.
+      executor: human
+      executor_settings:
+        assignees: { teams: [platform] }
+      instructions: |
+        Confirm each action item is done, or explain why it was dropped.

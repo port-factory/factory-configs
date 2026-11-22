@@ -1,0 +1,197 @@
+# A factory line that takes a small UI feature request from a GitHub issue to a merged pull request.
+#
+#   spec (agent)  ->  [a person approves the spec]  ->  build (agent, opens a PR)  ->  merge (agent)
+#                                                        |       ^
+#                                                        |       +-- changes requested or a failing check: back to build
+#                                                        +-- waits until the PR is approved and its checks pass
+#
+# Install after ui-bugs-line.yaml (it defines the shared environment, service account and merge agent):
+#   npx factory-cli install ui-features-line.yaml --dry-run, then without --dry-run.
+
+github:
+  token_secret: __GITHUB_OCEAN_<INSTALLATION>_<GITHUB_ORG>_ACCESS_TOKEN   # your org secret's name
+
+defaults:
+  model: claude-sonnet-5-5
+  environment: ui-bugs-demo
+
+service_accounts:
+  factory-agent@serviceaccounts.getport.io:
+    title: Factory agent
+
+agents:
+  factory-feature-planner:
+    description: Turns a feature request into a short spec with acceptance criteria.
+    system_prompt: |
+      You plan small UI features in a Port software factory line. You read the request and the mounted
+      repository, and write a short, concrete spec a person can approve in a minute. You never change code.
+      You always finish by calling the Port MCP tool report_work_item.
+
+  factory-feature-builder:
+    description: Builds an approved feature, opens a pull request, and attaches before/after screenshots.
+    system_prompt: |
+      You build small UI features in a Port software factory line. You implement the approved spec in the
+      mounted repository, prove it with before/after screenshots, open or update a GitHub pull request with
+      the github_* tools of Port MCP, and always finish by calling the Port MCP tool report_work_item.
+
+line:
+  identifier: ui_features
+  title: UI Features
+  description: >-
+    Takes a small UI feature request from a GitHub issue to a merged pull request. An agent writes a short spec
+    that a person approves, another builds it and opens a pull request with before/after screenshots, and once
+    the pull request is approved and its checks pass, an agent merges it.
+  team: [frontend_infra]
+  # Six items run at once; the rest wait in the queue.
+  max_running: 10
+  stages:
+    - identifier: spec
+      title: Spec
+      description: Writes a short spec with acceptance criteria for a person to approve.
+      executor: claude_managed_agent
+      agent: factory-feature-planner
+      executor_settings:
+        execution_identity:
+          type: service_account
+          identifier: factory-agent@serviceaccounts.getport.io
+      session:
+        resources:
+          - { type: github_repository, url: 'https://github.com/port-factory/factory-sample-app' }
+      instructions: |
+        Write a spec for the feature in this work item.
+
+        1. Read the work item with get_work_item.
+        2. Read the mounted repository (start with AGENTS.md and frontend/src) to see where the change goes.
+        3. Call report_work_item with outcome success and the artifact spec: markdown with
+           - "Goal": one or two sentences,
+           - "UI": what the user sees and does, step by step,
+           - "Acceptance criteria": three to six checkable bullets,
+           - "Files": the files you expect to change.
+           Keep it under 250 words. Don't change any code.
+
+        If the request is too vague to spec, report needs_info with one short question.
+        Never end without calling report_work_item.
+      checkpoints:
+        - identifier: artifacts
+          type: schema
+          schema:
+            properties:
+              spec: { type: string, format: markdown, title: Spec }
+            required: [spec]
+        - identifier: approve_spec
+          type: human_input
+          kind: approval
+          title: Approve the spec
+          responders:
+            usersQuery:
+              combinator: or
+              rules:
+                - { property: $identifier, operator: '=', value: 'daniel+swfactoryport@getport.io' }
+      max_tries: 3
+      timeout: 20m
+
+    - identifier: build
+      title: Build
+      description: Builds the approved spec and opens a pull request with before/after screenshots.
+      executor: claude_managed_agent
+      agent: factory-feature-builder
+      executor_settings:
+        execution_identity:
+          type: service_account
+          identifier: factory-agent@serviceaccounts.getport.io
+      session:
+        resources:
+          - { type: github_repository, url: 'https://github.com/port-factory/factory-sample-app' }
+      instructions: |
+        Build the feature in this work item. Its approved spec is in the spec artifact.
+
+        1. Read the work item with get_work_item, including its artifacts. If this prompt includes a reason from
+           an earlier try (changes requested, or a failing check), that is what this try must fix: read the pull
+           request's review comments and failing checks with Port MCP's github_* tools and address them.
+        2. If the work item already has a pr_url artifact, this is a follow-up: check out that pull request's
+           branch and push to it. Otherwise create a branch named feat/<short-description> from main.
+        3. Following AGENTS.md, run the app (`npm ci`, `npm run demo` in the background, wait for
+           http://localhost:5173), install the browser (`npx -y playwright@1.49.1 install --with-deps chromium`)
+           and take a 1280x800 "before" screenshot.
+        4. Implement the spec, meeting every acceptance criterion. Add or update tests for new behavior.
+        5. Run the checks from AGENTS.md (lint, format, typecheck, unit tests, frontend integration tests).
+        6. Take an "after" screenshot that shows the feature in use.
+        7. Upload both screenshots to Port with create_markdown_image_upload, the returned curlCommand, and
+           finalize_markdown_image_upload.
+        8. Push the branch, then open the pull request with Port MCP's github_* tools. Describe the feature and
+           the checks you ran, and link back to the work item. If the work item came from a GitHub issue (its
+           source_system is github), put `Fixes #<source_id>` in the description.
+        9. Call report_work_item with outcome success and these artifacts:
+           - pr_url: the pull request url.
+           - before_after: markdown with a "Before" and an "After" section, each with its image.
+           In the same report, update the work item's description: keep the text and append a "## Build"
+           section with the before/after images and the pull request link.
+
+        If the environment fails (npm, browser), report failed with retry: true and the error.
+        Never end without calling report_work_item.
+      checkpoints:
+        - identifier: artifacts
+          type: schema
+          schema:
+            properties:
+              pr_url: { type: string, format: url, title: Pull request }
+              before_after: { type: string, format: markdown, title: Before and after }
+            required: [pr_url, before_after]
+        - identifier: pr_ready
+          type: entity_condition
+          title: The pull request is approved and its checks pass
+          entity:
+            blueprint: githubPullRequest
+            match: { link: '{{ .workItem.artifacts.pr_url }}' }
+          pass_when:
+            combinator: and
+            rules:
+              - { property: reviewDecision, operator: '=', value: APPROVED }
+              - { property: checksState, operator: in, value: [SUCCESS, NEUTRAL] }
+          reject_when:
+            - query:
+                combinator: and
+                rules:
+                  - { property: reviewDecision, operator: '=', value: CHANGES_REQUESTED }
+                  - { property: changesRequestedAt, operator: '>', value: '{{ .stageRun.startedAt }}' }
+              reason: >-
+                A reviewer requested changes on {{ .entity.title }}:
+                {{ .entity.properties.changesRequestedComment // "see the review comments" }}.
+                Address them on the same branch.
+            - query:
+                combinator: and
+                rules: [{ property: checksState, operator: in, value: [FAILURE, ERROR] }]
+              reason: A check failed on {{ .entity.title }}. Read the failing check and fix it.
+          progress: >-
+            Review: {{ .entity.properties.reviewDecision // "pending" }},
+            checks: {{ .entity.properties.checksState // "pending" }}
+      max_tries: 5
+      timeout: 1h
+
+    - identifier: merge
+      title: Merge
+      description: Merges the approved pull request.
+      executor: claude_managed_agent
+      agent: factory-pr-merger
+      executor_settings:
+        execution_identity:
+          type: service_account
+          identifier: factory-agent@serviceaccounts.getport.io
+      instructions: |
+        The pull request in this work item's pr_url artifact is approved and its checks pass. Merge it.
+
+        1. Read the work item with get_work_item.
+        2. Squash-merge the pull request with github_merge_pull_request.
+        3. Call report_work_item with outcome success and the artifact merge_commit: the merge commit SHA.
+
+        If the merge fails because of a conflict or a new failing check, report failed with the reason.
+        Never end without calling report_work_item.
+      checkpoints:
+        - identifier: artifacts
+          type: schema
+          schema:
+            properties:
+              merge_commit: { type: string, title: Merge commit }
+            required: [merge_commit]
+      max_tries: 2
+      timeout: 15m

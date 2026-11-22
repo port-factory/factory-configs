@@ -1,0 +1,104 @@
+# Demo line for the platform team. No repositories are mounted and nothing files work into it, so it never runs.
+defaults:
+  model: claude-sonnet-5-5
+  environment: ui-bugs-demo
+
+service_accounts:
+  factory-agent@serviceaccounts.getport.io:
+    title: Factory agent
+
+agents:
+  platform-dependency-assessor:
+    description: Assesses a dependency upgrade's breaking changes and risk.
+    system_prompt: |
+      You assess dependency upgrades: read the changelog and release notes, list breaking changes and where the code uses them, and rate the risk. You always finish by calling the Port MCP tool report_work_item.
+  platform-dependency-upgrader:
+    description: Upgrades dependencies and adapts the code to breaking changes.
+    system_prompt: |
+      You upgrade dependencies: bump the version, adapt the code to breaking changes, run the tests and open a pull request. You always finish by calling the Port MCP tool report_work_item.
+
+line:
+  identifier: dependency_upgrades
+  title: Dependency Upgrades
+  description: >-
+    Takes a dependency update from Renovate to a merged upgrade. An agent assesses the changelog and breaking changes, another upgrades the code and opens a pull request, and once it is approved and green it merges.
+  team: [platform]
+  max_running: 5
+  stages:
+    - identifier: assess
+      title: Assess
+      description: Reads the changelog and rates the upgrade's risk.
+      executor: claude_managed_agent
+      agent: platform-dependency-assessor
+      executor_settings:
+        execution_identity: { type: service_account, identifier: factory-agent@serviceaccounts.getport.io }
+      instructions: |
+        Read the release notes between the current and target versions. List breaking changes and the call sites they affect, and rate the risk low, medium or high.
+        Never end without calling report_work_item.
+      checkpoints:
+        - identifier: artifacts
+          type: schema
+          schema:
+            properties:
+              impact: { type: string, format: markdown, title: Impact }
+              risk: { type: string, title: Risk }
+            required: [impact, risk]
+      max_tries: 3
+      timeout: 30m
+    - identifier: upgrade
+      title: Upgrade
+      description: Bumps the dependency, adapts the code and opens a pull request.
+      executor: claude_managed_agent
+      agent: platform-dependency-upgrader
+      executor_settings:
+        execution_identity: { type: service_account, identifier: factory-agent@serviceaccounts.getport.io }
+      instructions: |
+        Bump the dependency, fix what the breaking changes break, run the tests and open a pull request that links the assessment.
+        Never end without calling report_work_item.
+      checkpoints:
+        - identifier: artifacts
+          type: schema
+          schema:
+            properties:
+              pr_url: { type: string, format: url, title: Pull request }
+            required: [pr_url]
+        - identifier: pr_ready
+          type: entity_condition
+          title: The pull request is approved and its checks pass
+          entity:
+            blueprint: githubPullRequest
+            match: { link: '{{ .workItem.artifacts.pr_url }}' }
+          pass_when:
+            combinator: and
+            rules:
+              - { property: reviewDecision, operator: '=', value: APPROVED }
+              - { property: checksState, operator: in, value: [SUCCESS, NEUTRAL] }
+          reject_when:
+            - query:
+                combinator: and
+                rules:
+                  - { property: reviewDecision, operator: '=', value: CHANGES_REQUESTED }
+                  - { property: changesRequestedAt, operator: '>', value: '{{ .stageRun.startedAt }}' }
+              reason: 'A reviewer requested changes: {{ .entity.properties.changesRequestedComment // "see the review" }}'
+          progress: 'Review: {{ .entity.properties.reviewDecision // "pending" }}'
+      max_tries: 3
+      timeout: 1h
+    - identifier: merge
+      title: Merge
+      description: Merges the approved pull request.
+      executor: claude_managed_agent
+      agent: factory-pr-merger
+      executor_settings:
+        execution_identity: { type: service_account, identifier: factory-agent@serviceaccounts.getport.io }
+      instructions: |
+        Squash-merge the pull request in the pr_url artifact with github_merge_pull_request, then report the merge commit.
+        Never end without calling report_work_item.
+      checkpoints:
+        - identifier: artifacts
+          type: schema
+          schema:
+            properties:
+              merge_commit: { type: string, title: Merge commit }
+            required: [merge_commit]
+      max_tries: 2
+      timeout: 15m

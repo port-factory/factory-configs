@@ -1,0 +1,70 @@
+# Demo line for the developer_experience team. No repositories are mounted and nothing files work into it, so it never runs.
+defaults:
+  model: claude-sonnet-5-5
+  environment: ui-bugs-demo
+
+service_accounts:
+  factory-agent@serviceaccounts.getport.io:
+    title: Factory agent
+
+agents:
+  devex-docs-writer:
+    description: Writes product documentation from merged pull requests, in the docs' existing style.
+    system_prompt: |
+      You write product documentation from merged pull requests, in the docs' existing style. You always finish by calling the Port MCP tool report_work_item.
+  devex-docs-publisher:
+    description: Publishes approved documentation changes and checks the rendered pages.
+    system_prompt: |
+      You publish approved documentation changes and check the rendered pages and links. You always finish by calling the Port MCP tool report_work_item.
+
+line:
+  identifier: docs_from_prs
+  title: Docs from Merged PRs
+  description: >-
+    Keeps the docs current: when a merged pull request changes a public API or a user-facing flow, an agent drafts the docs change, a technical writer reviews it, and it publishes.
+  team: [developer_experience]
+  max_running: 5
+  stages:
+    - identifier: draft
+      title: Draft
+      description: Drafts the docs change from the merged pull request.
+      executor: claude_managed_agent
+      agent: devex-docs-writer
+      executor_settings:
+        execution_identity: { type: service_account, identifier: factory-agent@serviceaccounts.getport.io }
+      instructions: |
+        Read the merged pull request, find the docs pages it affects, and open a docs pull request that updates them.
+        Never end without calling report_work_item.
+      checkpoints:
+        - identifier: artifacts
+          type: schema
+          schema:
+            properties:
+              docs_pr_url: { type: string, format: url, title: Docs pull request }
+            required: [docs_pr_url]
+        - identifier: approve
+          type: human_input
+          kind: approval
+          title: Technical writer review
+          responders: { teams: [developer_experience] }
+      max_tries: 3
+      timeout: 30m
+    - identifier: publish
+      title: Publish
+      description: Publishes the docs and checks the rendered pages.
+      executor: claude_managed_agent
+      agent: devex-docs-publisher
+      executor_settings:
+        execution_identity: { type: service_account, identifier: factory-agent@serviceaccounts.getport.io }
+      instructions: |
+        Merge the docs pull request, wait for the docs site to deploy, and check the changed pages and their links.
+        Never end without calling report_work_item.
+      checkpoints:
+        - identifier: artifacts
+          type: schema
+          schema:
+            properties:
+              published_url: { type: string, format: url, title: Published page }
+            required: [published_url]
+      max_tries: 3
+      timeout: 20m

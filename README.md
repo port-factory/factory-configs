@@ -7,6 +7,8 @@ Build your own **Port software factory line**: an agent reproduces a bug and sav
 | Path | |
 |---|---|
 | [`examples/ui-bugs-line.yaml`](examples/ui-bugs-line.yaml) | The line from the demo video: reproduce → fix (waits on the PR) → merge |
+| [`examples/ui-features-line.yaml`](examples/ui-features-line.yaml) | A feature request from a GitHub issue to a merged PR: spec → a person approves the spec → build (waits on the PR) → merge. Install it after the bugs line, which defines the shared environment, service account and merge agent |
+| [`examples/team-lines/`](examples/team-lines) | Lines for other teams, to show what a whole factory looks like: dependency upgrades and incident follow-ups (Platform), vulnerability remediation (Security), data quality alerts (Data Platform), crash fixes (Mobile), docs from merged PRs (Developer Experience). They mount no repos and nothing files work into them, so they install but never run: copy one as a starting point |
 | [`.agents/skills/create-factory-line/`](.agents/skills/create-factory-line/SKILL.md) | A skill that teaches your coding agent to write, install and debug a line |
 | `.claude/skills/`, `.cursor/skills/` | The same skill for Claude Code and Cursor (copies; see below) |
 
