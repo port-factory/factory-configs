@@ -1,0 +1,17 @@
+name: Skills in sync
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Skill copies match .agents/skills
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./scripts/sync-skills.sh --check

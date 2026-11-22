@@ -1,0 +1,216 @@
+# A factory line that takes a UI bug from a report to a reviewed fix, with screenshots on the work item.
+#
+#   reproduce (agent)  ->  fix (agent, opens a PR)  ->  merge (agent)
+#                            |       ^
+#                            |       +-- changes requested or a failing check: back to fix with the reason
+#                            +-- waits until the PR is approved and its checks pass, then moves on by itself
+#
+# Change these for your own repo:
+#   - REPO: the github_repository url of both agent stages
+#   - the service account email (created by the CLI if it doesn't exist)
+#   - github.token_secret: your GitHub integration's rotating app token secret. The CLI creates a GitHub MCP
+#     server with it and connects the service account, so the agents get github_* tools through Port MCP.
+#   - the PR condition reads reviewDecision, checksState, changesRequestedAt and changesRequestedComment from
+#     your GitHub integration's PR mapping (pull-request kind with selector api: graphql)
+#
+# Install: npx factory-cli install ui-bugs-line.yaml --dry-run, then without --dry-run.
+
+github:
+  # The GitHub integration's app token, rotated by Port. No personal access token or vault needed.
+  token_secret: __GITHUB_OCEAN_<INSTALLATION>_<GITHUB_ORG>_ACCESS_TOKEN   # your org secret's name
+
+defaults:
+  model: claude-sonnet-5-5
+  environment: ui-bugs-demo
+
+environments:
+  ui-bugs-demo: {} # cloud, unrestricted networking
+
+service_accounts:
+  factory-agent@serviceaccounts.getport.io:
+    title: Factory agent
+
+agents:
+  factory-bug-reproducer:
+    description: Reproduces UI bugs in a running app and attaches a screenshot to the work item.
+    system_prompt: |
+      You reproduce UI bug reports in a Port software factory line. You run the app from the mounted
+      repository, prove the bug with a screenshot, and attach the screenshot to the work item through
+      Port MCP. You never change code. You always finish by calling the Port MCP tool report_work_item.
+
+  factory-pr-merger:
+    description: Merges an approved pull request with passing checks.
+    system_prompt: |
+      You merge approved pull requests in a Port software factory line with the github_* tools of Port MCP,
+      and always finish by calling the Port MCP tool report_work_item.
+
+  factory-bug-fixer:
+    description: Fixes UI bugs, opens a pull request, and attaches before/after screenshots to the work item.
+    system_prompt: |
+      You fix bugs in a Port software factory line. You make the smallest correct change in the mounted
+      repository, prove it with before/after screenshots, open or update a GitHub pull request with the
+      github_* tools of Port MCP, and always finish by calling the Port MCP tool report_work_item.
+
+line:
+  identifier: ui_bugs
+  title: UI Bugs
+  description: >-
+    Takes a UI bug from report to merged fix. An agent reproduces it with a screenshot, another fixes it and opens
+    a pull request with before/after screenshots, and once the pull request is approved and its checks pass, an
+    agent merges it. Requested changes and failing checks send it back to the fix.
+  team: [default_team]
+  stages:
+    - identifier: reproduce
+      title: Reproduce
+      description: Runs the app and attaches a screenshot that shows the bug.
+      executor: claude_managed_agent
+      agent: factory-bug-reproducer
+      executor_settings:
+        execution_identity:
+          type: service_account
+          identifier: factory-agent@serviceaccounts.getport.io
+      session:
+        resources:
+          - { type: github_repository, url: 'https://github.com/port-factory/factory-sample-app' }
+      instructions: |
+        Reproduce the bug in this work item.
+
+        1. Read the work item with get_work_item.
+        2. In the mounted repository, follow AGENTS.md: run `npm ci`, start `npm run demo` in the background,
+           and wait until http://localhost:5173 responds.
+        3. Install the browser (`npx -y playwright@1.49.1 install --with-deps chromium`) and take a 1280x800
+           screenshot of the page that clearly shows the bug. If the bug is in one element, a second, zoomed-in
+           screenshot of that element helps.
+        4. Upload each screenshot to Port: call create_markdown_image_upload (filename, contentType image/png,
+           size in bytes), run the curlCommand it returns from the directory that holds the file, then call
+           finalize_markdown_image_upload. Use the markdown snippet it returns.
+        5. Find the likely cause in the code (file and line), but don't change anything.
+        6. Call report_work_item with outcome success and these artifacts:
+           - reproduction: markdown with "Steps", "Expected", "Actual", "Likely cause" and the screenshot image(s).
+           - screenshot_url: the url of the main screenshot.
+           In the same report, update the work item's description: keep the original text and append a
+           "## Reproduction" section with the screenshot image(s) and a one-line summary.
+
+        If you can't reproduce it, report needs_info with a short question to the reporter.
+        If the environment fails (npm, browser), report failed with retry: true and the error.
+        Never end without calling report_work_item.
+      checkpoints:
+        - identifier: artifacts
+          type: schema
+          schema:
+            properties:
+              reproduction: { type: string, format: markdown, title: Reproduction }
+              screenshot_url: { type: string, format: url, title: Screenshot }
+            required: [reproduction, screenshot_url]
+      max_tries: 2
+      timeout: 30m
+
+    - identifier: fix
+      title: Fix
+      description: Opens a pull request with the fix and attaches before/after screenshots.
+      executor: claude_managed_agent
+      agent: factory-bug-fixer
+      executor_settings:
+        execution_identity:
+          type: service_account
+          identifier: factory-agent@serviceaccounts.getport.io
+      session:
+        resources:
+          - { type: github_repository, url: 'https://github.com/port-factory/factory-sample-app' }
+      instructions: |
+        Fix the bug in this work item. The reproduce stage's artifacts describe it and its likely cause.
+
+        1. Read the work item with get_work_item, including its artifacts. If this prompt includes a reason from
+           an earlier try (changes requested, or a failing check), that is what this try must fix: read the pull
+           request's review comments and failing checks with Port MCP's github_* tools and address them.
+        2. If the work item already has a pr_url artifact, this is a follow-up: check out that pull request's
+           branch and push to it, so the same pull request is updated. Otherwise create a branch named
+           fix/<short-description> from main.
+        3. Make the smallest correct fix. Add or update a unit test when the behavior is testable.
+        4. Run the checks from AGENTS.md (lint, format, typecheck, unit tests, frontend integration tests).
+           Fix anything you broke.
+        5. Take an "after" screenshot the same way the reproduce stage did (see AGENTS.md), with the fix running.
+           For "before", reuse the reproduce stage's screenshot. On a follow-up, "before" is the previous try's
+           after screenshot.
+        6. Upload the after screenshot to Port with create_markdown_image_upload, the returned curlCommand, and
+           finalize_markdown_image_upload.
+        7. Push the branch, then open the pull request with Port MCP's github_* tools (on a follow-up, pushing to
+           its branch updates it). Describe the bug, the fix and the checks you ran, and link back to the
+           work item.
+        8. Call report_work_item with outcome success and these artifacts:
+           - pr_url: the pull request url.
+           - before_after: markdown with a "Before" and an "After" heading, each with its image, and a
+             one-paragraph summary of the change.
+           In the same report, update the work item's description: keep the existing text and append (or, on
+           a follow-up, replace) a "## Fix" section with the before/after images and the pull request link.
+
+        If the environment fails (npm, browser, GitHub), report failed with retry: true and the error.
+        Never end without calling report_work_item.
+      checkpoints:
+        - identifier: artifacts
+          type: schema
+          schema:
+            properties:
+              pr_url: { type: string, format: url, title: Pull request }
+              before_after: { type: string, format: markdown, title: Before and after }
+            required: [pr_url, before_after]
+        - identifier: pr_ready
+          type: entity_condition
+          title: The pull request is approved and its checks pass
+          entity:
+            blueprint: githubPullRequest
+            match: { link: '{{ .workItem.artifacts.pr_url }}' }
+          pass_when:
+            combinator: and
+            rules:
+              - { property: reviewDecision, operator: '=', value: APPROVED }
+              - { property: checksState, operator: in, value: [SUCCESS, NEUTRAL] }
+          # The condition has no memory of earlier rejections, so only a change request made after this try
+          # started sends the item back again.
+          reject_when:
+            - query:
+                combinator: and
+                rules:
+                  - { property: reviewDecision, operator: '=', value: CHANGES_REQUESTED }
+                  - { property: changesRequestedAt, operator: '>', value: '{{ .stageRun.startedAt }}' }
+              reason: >-
+                A reviewer requested changes on {{ .entity.title }}:
+                {{ .entity.properties.changesRequestedComment // "see the review comments" }}.
+                Address them on the same branch.
+            - query:
+                combinator: and
+                rules: [{ property: checksState, operator: in, value: [FAILURE, ERROR] }]
+              reason: A check failed on {{ .entity.title }}. Read the failing check and fix it.
+          progress: >-
+            Review: {{ .entity.properties.reviewDecision // "pending" }},
+            checks: {{ .entity.properties.checksState // "pending" }}
+      max_tries: 5
+      timeout: 1h
+
+    - identifier: merge
+      title: Merge
+      description: Merges the approved pull request.
+      executor: claude_managed_agent
+      agent: factory-pr-merger
+      executor_settings:
+        execution_identity:
+          type: service_account
+          identifier: factory-agent@serviceaccounts.getport.io
+      instructions: |
+        The pull request in this work item's pr_url artifact is approved and its checks pass. Merge it.
+
+        1. Read the work item with get_work_item.
+        2. Squash-merge the pull request with github_merge_pull_request.
+        3. Call report_work_item with outcome success and the artifact merge_commit: the merge commit SHA.
+
+        If the merge fails because of a conflict or a new failing check, report failed with the reason.
+        Never end without calling report_work_item.
+      checkpoints:
+        - identifier: artifacts
+          type: schema
+          schema:
+            properties:
+              merge_commit: { type: string, title: Merge commit }
+            required: [merge_commit]
+      max_tries: 2
+      timeout: 15m
